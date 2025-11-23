@@ -211,6 +211,8 @@ mod imp {
             obj.load_app_state();
             obj.setup_gactions();
             obj.setup_preferences();
+            #[cfg(target_os = "linux")]
+            obj.setup_tray_icon();
             obj.setup_ui();
             obj.setup_connection_monitors();
             obj.setup_notification_actions_monitor();
@@ -1046,6 +1048,51 @@ impl PacketApplicationWindow {
                         .unwrap()
                         .set_download_path(Some(folder_path));
                 };
+            }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    /// There's `tray-icon` for cross-platform systray support but on linux it still relies on gtk3 which doesn't
+    /// work with gtk4 environment.
+    ///
+    /// https://github.com/tauri-apps/tray-icon/pull/201
+    fn setup_tray_icon(&self) {
+        use crate::tray;
+        use ksni::*;
+
+        let imp = self.imp();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<tray::TrayMessage>(1);
+        tokio_runtime().spawn(async move {
+            let tray = crate::tray::Tray { tx: tx };
+            _ = if ashpd::is_sandboxed().await {
+                tray.spawn_without_dbus_name().await
+            } else {
+                tray.spawn().await
+            }
+            .inspect_err(
+                |err| tracing::warn!(%err, "Failed to setup KStatusNotifierItem tray icon"),
+            );
+        });
+
+        glib::spawn_future_local(clone!(
+            #[weak]
+            imp,
+            async move {
+                while let Some(msg) = rx.recv().await {
+                    match msg {
+                        tray::TrayMessage::OpenWindow => {
+                            imp.obj().present();
+                        }
+                        tray::TrayMessage::Quit => {
+                            imp.should_quit.replace(true);
+                            // FIXME: If preference window is opened, that window gets closed instead of
+                            // PacketApplicationWindow for some reason
+                            imp.obj().close();
+                        }
+                    }
+                }
             }
         ));
     }
