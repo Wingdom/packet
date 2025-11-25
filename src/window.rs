@@ -54,7 +54,7 @@ mod imp {
 
     use super::*;
 
-    #[derive(Debug, gtk::CompositeTemplate, better_default::Default)]
+    #[derive(gtk::CompositeTemplate, better_default::Default)]
     #[template(resource = "/io/github/nozwock/Packet/ui/window.ui")]
     pub struct PacketApplicationWindow {
         #[default(gio::Settings::new(APP_ID))]
@@ -114,6 +114,10 @@ mod imp {
         #[template_child]
         pub nautilus_plugin_switch: TemplateChild<adw::SwitchRow>,
         pub nautilus_plugin_switch_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        #[template_child]
+        pub tray_icon_group: TemplateChild<adw::PreferencesGroup>,
+        #[template_child]
+        pub tray_icon_switch: TemplateChild<adw::SwitchRow>,
 
         #[template_child]
         pub main_box: TemplateChild<gtk::Box>,
@@ -178,6 +182,9 @@ mod imp {
         pub is_recipients_dialog_opened: Cell<bool>,
 
         pub nautilus_plugin: NautilusPlugin,
+
+        #[cfg(target_os = "linux")]
+        pub tray_icon_handle: RefCell<Option<ksni::Handle<crate::tray::Tray>>>,
     }
 
     #[glib::object_subclass]
@@ -462,6 +469,9 @@ impl PacketApplicationWindow {
                 "active",
             )
             .build();
+        imp.settings
+            .bind("enable-tray-icon", &imp.tray_icon_switch.get(), "active")
+            .build();
 
         // TODO: The value of many preference options are only validated in the
         // UI, not outside of it.
@@ -570,6 +580,31 @@ impl PacketApplicationWindow {
         ));
         imp.nautilus_plugin_switch_handler_id
             .replace(Some(_signal_handle));
+
+        #[cfg(target_os = "linux")]
+        imp.tray_icon_switch.connect_active_notify(clone!(
+            #[weak]
+            imp,
+            move |switch| {
+                glib::spawn_future_local(clone!(
+                    #[weak]
+                    imp,
+                    #[weak]
+                    switch,
+                    async move {
+                        switch.set_sensitive(false);
+
+                        if switch.is_active() {
+                            _ = imp.obj().enable_tray_icon().await;
+                        } else {
+                            imp.obj().disable_tray_icon().await;
+                        }
+
+                        switch.set_sensitive(true);
+                    }
+                ));
+            }
+        ));
 
         let _signal_handle = imp.run_in_background_switch.connect_active_notify(clone!(
             #[weak]
@@ -1058,23 +1093,54 @@ impl PacketApplicationWindow {
     ///
     /// https://github.com/tauri-apps/tray-icon/pull/201
     fn setup_tray_icon(&self) {
+        let imp = self.imp();
+
+        imp.tray_icon_group.set_visible(true);
+
+        let is_enable_tray_icon = imp.settings.boolean("enable-tray-icon");
+        tracing::debug!(?is_enable_tray_icon);
+        if is_enable_tray_icon {
+            self.enable_tray_icon();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn disable_tray_icon(&self) {
+        let imp = self.imp();
+
+        if let Some(ref mut handle) = *imp.tray_icon_handle.borrow_mut() {
+            tracing::debug!("Disabling tray icon");
+            handle.shutdown().await;
+        }
+        imp.tray_icon_handle.take();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn enable_tray_icon(&self) -> glib::JoinHandle<()> {
         use crate::tray;
         use ksni::*;
 
         let imp = self.imp();
 
+        tracing::debug!("Enabling tray icon");
         let (tx, mut rx) = tokio::sync::mpsc::channel::<tray::TrayMessage>(1);
-        tokio_runtime().spawn(async move {
-            let tray = crate::tray::Tray { tx: tx };
-            _ = if ashpd::is_sandboxed().await {
-                tray.spawn_without_dbus_name().await
-            } else {
-                tray.spawn().await
+        let handle = glib::spawn_future_local(clone!(
+            #[weak]
+            imp,
+            async move {
+                let tray = crate::tray::Tray { tx: tx };
+                let handle = if ashpd::is_sandboxed().await {
+                    tray.spawn_without_dbus_name().await
+                } else {
+                    tray.spawn().await
+                }
+                .inspect_err(
+                    |err| tracing::warn!(%err, "Failed to setup KStatusNotifierItem tray icon"),
+                )
+                .ok();
+                *imp.tray_icon_handle.borrow_mut() = handle;
             }
-            .inspect_err(
-                |err| tracing::warn!(%err, "Failed to setup KStatusNotifierItem tray icon"),
-            );
-        });
+        ));
 
         glib::spawn_future_local(clone!(
             #[weak]
@@ -1095,6 +1161,8 @@ impl PacketApplicationWindow {
                 }
             }
         ));
+
+        handle
     }
 
     fn setup_ui(&self) {
