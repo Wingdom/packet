@@ -103,6 +103,8 @@ fn emit_send_files(win: &PacketApplicationWindow, model_item: &SendRequestState)
     tokio_runtime().spawn(clone!(
         #[weak(rename_to = file_sender)]
         imp.file_sender,
+        // #[weak]
+        // model_item,
         async move {
             // FIXME: Set Failed state on Err and update UI on Failed state change
             // model_item.set_transfer_state(TransferState::Failed);
